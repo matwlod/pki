@@ -1,143 +1,87 @@
-# Python standard libraries
-import json
+import secrets
+
+from authlib.oauth2 import OAuth2Error
+from flask import Flask, redirect, url_for, session, request, jsonify
+from authlib.integrations.flask_client import OAuth
 import os
-import sqlite3
 
-# Third-party libraries
-from flask import Flask, redirect, request, url_for
-from flask_login import (
-    LoginManager,
-    current_user,
-    login_required,
-    login_user,
-    logout_user,
-)
-from oauthlib.oauth2 import WebApplicationClient
-import requests
-
-# Internal imports
-from db import init_db_command
-from user import User
-key="664959834099-b1k9b7ctp95t95sp0ru64jaopuo35jni.apps.googleusercontent.com"
-secret="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"
-# Configuration
-GOOGLE_CLIENT_ID = key#os.environ.get("GOOGLE_CLIENT_ID", None)
-GOOGLE_CLIENT_SECRET = secret#os.environ.get("GOOGLE_CLIENT_SECRET", None)
-GOOGLE_DISCOVERY_URL = (
-"https://accounts.google.com/.well-known/openid-configuration"
-)
-
-
-# Flask app setup
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
+app.secret_key = os.urandom(24)
 
-# User session management setup
-# https://flask-login.readthedocs.io/en/latest
-login_manager = LoginManager()
-login_manager.init_app(app)
-
-# Naive database setup
-try:
-    init_db_command()
-except sqlite3.OperationalError:
-    # Assume it's already been created
-    pass
-
-# OAuth 2 client setup
-client = WebApplicationClient(GOOGLE_CLIENT_ID)
-
-# Flask-Login helper to retrieve a user from our db
-@login_manager.user_loader
-def load_user(user_id):
-    return User.get(user_id)
-def get_google_provider_cfg():
-    return requests.get(GOOGLE_DISCOVERY_URL).json()
-@app.route("/")
-def index():
-    if current_user.is_authenticated:
-        return (
-            "<p>Hello, {}! You're logged in! Email: {}</p>"
-            "<div><p>Google Profile Picture:</p>"
-            '<img src="{}" alt="Google profile pic"></img></div>'
-            '<a class="button" href="/logout">Logout</a>'.format(
-                current_user.name, current_user.email, current_user.profile_pic
-            )
-        )
-    else:
-        return '<a class="button" href="/login">Google Login</a>'
-
-@app.route("/login")
-def login():
-    google_provider_cfg = get_google_provider_cfg()
-    authorization_endpoint = google_provider_cfg["authorization_endpoint"]
-    print(request.base_url + "/callback")
-    request_uri = client.prepare_request_uri(
-        authorization_endpoint,
-        redirect_uri=request.base_url + "/callback",
-        scope=["openid", "email", "profile"],
-    )
-    return redirect(request_uri)
-
-@app.route("/login/callback")
-def callback():
-    # Get authorization code Google sent back to you
-    code = request.args.get("code")
-    # Find out what URL to hit to get tokens that allow you to ask for
-    # things on behalf of a user
-    google_provider_cfg = get_google_provider_cfg()
-    token_endpoint = google_provider_cfg["token_endpoint"]
-    # Prepare and send a request to get tokens! Yay tokens!
-    token_url, headers, body = client.prepare_token_request(
-        token_endpoint,
-        authorization_response=request.url,
-        redirect_url=request.base_url,
-        code=code
-    )
-    token_response = requests.post(
-        token_url,
-        headers=headers,
-        data=body,
-        auth=(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET),
+# OAuth configuration
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id='664959834099-b1k9b7ctp95t95sp0ru64jaopuo35jni.apps.googleusercontent.com',
+    client_secret='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',
+    access_token_url='https://accounts.google.com/o/oauth2/token',
+    access_token_params=None,
+    authorize_url='https://accounts.google.com/o/oauth2/auth',
+    authorize_params={'scope': 'openid email profile'},
+    redirect_uri='http://localhost:5000/callback',
+    jwks_uri='https://www.googleapis.com/oauth2/v3/certs',
+    client_kwargs={'scope': 'openid email profile'}
+)
+github = oauth.register(
+    name='pki-appname',
+    client_id='Ov23liHVHG6C6AMBcP1F',
+    client_secret='c8b35fa27665e300cd608bcfc0b1ce545fca18d6',
+    access_token_url='https://github.com/login/oauth/access_token',
+    authorize_url='https://github.com/login/oauth/authorize',
+    client_kwargs={'scope': 'user:email'}
+)
+@app.route('/')
+def home():
+    user = session.get('user')
+    if user:
+        user_name = user.get('name', 'User')
+        return f'Welcome {user_name}! <a href="/logout">Logout</a>'
+    return (
+        'Welcome to the Flask App.<br>'
+        '<a href="/login/google">Login with Google</a><br>'
+        '<a href="/login/github">Login with GitHub</a>'
     )
 
-    # Parse the tokens!
-    client.parse_request_body_response(json.dumps(token_response.json()))
-    # Now that you have tokens (yay) let's find and hit the URL
-    # from Google that gives you the user's profile information,
-    # including their Google profile image and email
-    userinfo_endpoint = google_provider_cfg["userinfo_endpoint"]
-    uri, headers, body = client.add_token(userinfo_endpoint)
-    userinfo_response = requests.get(uri, headers=headers, data=body)
-    # You want to make sure their email is verified.
-    # The user authenticated with Google, authorized your
-    # app, and now you've verified their email through Google!
-    if userinfo_response.json().get("email_verified"):
-        unique_id = userinfo_response.json()["sub"]
-        users_email = userinfo_response.json()["email"]
-        picture = userinfo_response.json()["picture"]
-        users_name = userinfo_response.json()["given_name"]
-    else:
-        return "User email not available or not verified by Google.", 400
-    # Create a user in your db with the information provided
-    # by Google
-    user = User(
-        id_=unique_id, name=users_name, email=users_email, profile_pic=picture
-    )
+@app.route('/login/google')
+def login_google():
+    # Generate a nonce and store it in the session
+    nonce = secrets.token_urlsafe(16)
+    session['nonce'] = nonce
+    redirect_uri = url_for('callback_google', _external=True)
+    return google.authorize_redirect(redirect_uri, nonce=nonce)
 
-    # Doesn't exist? Add it to the database.
-    if not User.get(unique_id):
-        User.create(unique_id, users_name, users_email, picture)
+@app.route('/login/github')
+def login_github():
+    redirect_uri = url_for('callback_github', _external=True)
+    return github.authorize_redirect(redirect_uri)
 
-    # Begin user session by logging the user in
-    login_user(user)
+@app.route('/callback/google')
+def callback_google():
+    try:
+        token = google.authorize_access_token()
+        nonce = session.pop('nonce', None)  # Retrieve and remove nonce from session
+        user = google.parse_id_token(token, nonce=nonce)
+        session['user'] = user
+        return redirect(url_for('home'))
+    except OAuth2Error as error:
+        return f"Error: {error.error} - {error.description}"
 
-    # Send user back to homepage
-    return redirect(url_for("index"))
-@app.route("/logout")
-@login_required
+@app.route('/callback/github')
+def callback_github():
+    try:
+        token = github.authorize_access_token()
+        resp = github.get('user')
+        user = resp.json()
+        user['name'] = user.get('name', user.get('login'))  # Use 'login' if 'name' is not available
+        session['user'] = user
+        return redirect(url_for('home'))
+    except OAuth2Error as error:
+        return f"Error: {error.error} - {error.description}"
+
+@app.route('/logout')
 def logout():
-    logout_user()
-    return redirect(url_for("index"))
+    session.pop('user', None)
+    return redirect(url_for('home'))
 
-app.run()
+if __name__ == '__main__':
+    app.run()
